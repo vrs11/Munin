@@ -1,13 +1,16 @@
 import AppKit
 import CryptoKit
 import Foundation
+import ImageIO
 import os
+import UniformTypeIdentifiers
 
 @MainActor
 final class ClipboardStore: ObservableObject {
     static let maxEntries = 100
 
     @Published private(set) var entries: [ClipboardEntry] = []
+    @Published private(set) var isMonitoringPaused = false
 
     private let pasteboard: NSPasteboard
     private let fileManager: FileManager
@@ -18,14 +21,18 @@ final class ClipboardStore: ObservableObject {
     private var lastChangeCount: Int
     private var suppressedChangeCount: Int?
     private var pendingCaptureRetries: [DispatchWorkItem] = []
+    private var captureProcessingTask: Task<Void, Never>?
+    private var pendingPersistTask: Task<Void, Never>?
 
     private var recentSignatures: [String] = []
     private var recentSignatureSet: Set<String> = []
+    private let persistenceWriter = ClipboardHistoryPersistenceWriter()
 
     private static let pollInterval: TimeInterval = 0.2
     private static let pollTolerance: TimeInterval = 0.05
     private static let captureRetryDelays: [TimeInterval] = [0.06, 0.18]
     private static let dedupeSignatureWindow = 250
+    private static let persistenceDebounceNanoseconds: UInt64 = 350_000_000
 
     init(pasteboard: NSPasteboard = .general, fileManager: FileManager = .default) {
         self.pasteboard = pasteboard
@@ -60,30 +67,56 @@ final class ClipboardStore: ObservableObject {
     func stopMonitoring() {
         timer?.invalidate()
         timer = nil
-        cancelPendingCaptureRetries()
+        cancelPendingCaptureWork()
+        flushPendingPersistence()
     }
 
     func requestImmediateCheck() {
+        guard !isMonitoringPaused else { return }
         checkForPasteboardChanges()
+    }
+
+    func setMonitoringPaused(_ paused: Bool) {
+        isMonitoringPaused = paused
+        if paused {
+            cancelPendingCaptureWork()
+            lastChangeCount = pasteboard.changeCount
+        }
+    }
+
+    func clearHistory() {
+        entries.removeAll(keepingCapacity: true)
+        rebuildSignatureCache()
+        schedulePersist()
     }
 
     func deleteEntry(id: UUID) {
         entries.removeAll { $0.id == id }
         rebuildSignatureCache()
-        persist()
+        schedulePersist()
     }
 
     func copyEntryToPasteboard(_ entry: ClipboardEntry) {
-        pasteboard.clearContents()
-
-        let writeSucceeded: Bool
+        let writableObjects: [NSPasteboardWriting]
+        let stringToWrite: String?
         switch entry.kind {
         case .text:
             guard let text = entry.text else { return }
-            writeSucceeded = pasteboard.setString(text, forType: .string)
+            writableObjects = []
+            stringToWrite = text
         case .image:
             guard let image = entry.nsImage else { return }
-            writeSucceeded = pasteboard.writeObjects([image])
+            writableObjects = [image]
+            stringToWrite = nil
+        }
+
+        pasteboard.clearContents()
+
+        let writeSucceeded: Bool
+        if let stringToWrite {
+            writeSucceeded = pasteboard.setString(stringToWrite, forType: .string)
+        } else {
+            writeSucceeded = pasteboard.writeObjects(writableObjects)
         }
 
         guard writeSucceeded else {
@@ -95,11 +128,16 @@ final class ClipboardStore: ObservableObject {
     }
 
     private func checkForPasteboardChanges() {
+        guard !isMonitoringPaused else {
+            lastChangeCount = pasteboard.changeCount
+            return
+        }
+
         let currentChangeCount = pasteboard.changeCount
         guard currentChangeCount != lastChangeCount else { return }
         lastChangeCount = currentChangeCount
 
-        cancelPendingCaptureRetries()
+        cancelPendingCaptureWork()
 
         if currentChangeCount == suppressedChangeCount {
             suppressedChangeCount = nil
@@ -112,12 +150,19 @@ final class ClipboardStore: ObservableObject {
     private func attemptCapture(forChangeCount changeCount: Int, retryIndex: Int) {
         guard pasteboard.changeCount == changeCount else { return }
 
-        guard let captured = captureCurrentPasteboardEntry() else {
+        guard let snapshot = snapshotCurrentPasteboardPayload() else {
             scheduleCaptureRetry(forChangeCount: changeCount, retryIndex: retryIndex)
             return
         }
 
-        addEntry(captured.entry, signature: captured.signature)
+        captureProcessingTask?.cancel()
+        captureProcessingTask = Task.detached(priority: .utility) { [weak self] in
+            guard let captured = ClipboardPayloadProcessor.process(snapshot) else { return }
+
+            await MainActor.run { [weak self] in
+                self?.completeCapture(captured, forChangeCount: changeCount)
+            }
+        }
     }
 
     private func scheduleCaptureRetry(forChangeCount changeCount: Int, retryIndex: Int) {
@@ -139,80 +184,73 @@ final class ClipboardStore: ObservableObject {
         pendingCaptureRetries.removeAll(keepingCapacity: true)
     }
 
-    private func captureCurrentPasteboardEntry() -> CapturedEntry? {
-        if let text = readTextFromPasteboard() {
-            let normalized = normalizeTextForSignature(text)
-            guard !normalized.isEmpty else { return nil }
-            return CapturedEntry(
-                entry: ClipboardEntry(text: text),
-                signature: signatureForText(normalized)
-            )
+    private func cancelPendingCaptureWork() {
+        cancelPendingCaptureRetries()
+        captureProcessingTask?.cancel()
+        captureProcessingTask = nil
+    }
+
+    private func completeCapture(_ captured: CapturedEntry, forChangeCount changeCount: Int) {
+        guard !isMonitoringPaused else { return }
+        guard pasteboard.changeCount == changeCount else { return }
+
+        addEntry(captured.entry, signature: captured.signature)
+    }
+
+    private func snapshotCurrentPasteboardPayload() -> ClipboardPayload? {
+        let types = pasteboard.types ?? []
+
+        if let textPayload = snapshotTextPayload(types: types) {
+            return textPayload
         }
 
-        if let imagePayload = readImageFromPasteboard() {
-            return CapturedEntry(
-                entry: ClipboardEntry(imagePNGData: imagePayload.pngData),
-                signature: signatureForImage(imagePayload.image, fallbackData: imagePayload.pngData)
-            )
+        if let imagePayload = snapshotImagePayload(types: types) {
+            return imagePayload
         }
 
         return nil
     }
 
-    private func readTextFromPasteboard() -> String? {
-        if let string = pasteboard.string(forType: .string), !string.isEmpty {
-            return string
-        }
+    private func snapshotTextPayload(types: [NSPasteboard.PasteboardType]) -> ClipboardPayload? {
+        if types.contains(.string) {
+            if let data = pasteboard.data(forType: .string) {
+                guard data.count <= ClipboardLimits.maxCapturedTextUTF8Bytes else { return nil }
+                return .plainTextData(data)
+            }
 
-        if let textObject = pasteboard.readObjects(forClasses: [NSString.self], options: nil)?.first as? NSString {
-            let text = String(textObject)
-            if !text.isEmpty {
-                return text
+            if let string = pasteboard.string(forType: .string),
+               !string.isEmpty,
+               string.utf8.count <= ClipboardLimits.maxCapturedTextUTF8Bytes {
+                return .plainText(string)
             }
         }
 
-        if let rtfData = pasteboard.data(forType: .rtf),
-           let attributed = try? NSAttributedString(
-               data: rtfData,
-               options: [.documentType: NSAttributedString.DocumentType.rtf],
-               documentAttributes: nil
-           ) {
-            let string = attributed.string
-            if !string.isEmpty {
-                return string
-            }
+        if types.contains(.rtf),
+           let data = pasteboard.data(forType: .rtf),
+           data.count <= ClipboardLimits.maxRichTextDataBytes {
+            return .richTextData(data, .rtf)
         }
 
-        if let htmlData = pasteboard.data(forType: .html),
-           let attributed = try? NSAttributedString(
-               data: htmlData,
-               options: [.documentType: NSAttributedString.DocumentType.html],
-               documentAttributes: nil
-           ) {
-            let string = attributed.string
-            if !string.isEmpty {
-                return string
-            }
+        if types.contains(.html),
+           let data = pasteboard.data(forType: .html),
+           data.count <= ClipboardLimits.maxRichTextDataBytes {
+            return .richTextData(data, .html)
         }
 
         return nil
     }
 
-    private func readImageFromPasteboard() -> (image: NSImage, pngData: Data)? {
-        if let image = pasteboard.readObjects(forClasses: [NSImage.self], options: nil)?.first as? NSImage,
-           let pngData = image.pngData() {
-            return (image, pngData)
+    private func snapshotImagePayload(types: [NSPasteboard.PasteboardType]) -> ClipboardPayload? {
+        if types.contains(.png),
+           let data = pasteboard.data(forType: .png),
+           data.count <= ClipboardLimits.maxRawImageBytes {
+            return .imageData(data, .png)
         }
 
-        if let pngData = pasteboard.data(forType: .png),
-           let image = NSImage(data: pngData) {
-            return (image, pngData)
-        }
-
-        if let tiffData = pasteboard.data(forType: .tiff),
-           let image = NSImage(data: tiffData),
-           let pngData = image.pngData() {
-            return (image, pngData)
+        if types.contains(.tiff),
+           let data = pasteboard.data(forType: .tiff),
+           data.count <= ClipboardLimits.maxRawImageBytes {
+            return .imageData(data, .tiff)
         }
 
         return nil
@@ -228,7 +266,7 @@ final class ClipboardStore: ObservableObject {
             entries.removeLast(entries.count - Self.maxEntries)
         }
 
-        persist()
+        schedulePersist()
     }
 
     private func registerSignature(_ signature: String) {
@@ -252,47 +290,9 @@ final class ClipboardStore: ObservableObject {
         recentSignatureSet.removeAll(keepingCapacity: true)
 
         for entry in entries {
-            guard let signature = signature(forStoredEntry: entry) else { continue }
+            guard let signature = ClipboardPayloadProcessor.signature(forStoredEntry: entry) else { continue }
             registerSignature(signature)
         }
-    }
-
-    private func signature(forStoredEntry entry: ClipboardEntry) -> String? {
-        switch entry.kind {
-        case .text:
-            guard let text = entry.text else { return nil }
-            let normalized = normalizeTextForSignature(text)
-            guard !normalized.isEmpty else { return nil }
-            return signatureForText(normalized)
-        case .image:
-            guard let pngData = entry.imagePNGData else { return nil }
-            if let image = NSImage(data: pngData) {
-                return signatureForImage(image, fallbackData: pngData)
-            }
-            return "i:fallback:\(sha256Hex(pngData))"
-        }
-    }
-
-    private func normalizeTextForSignature(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .precomposedStringWithCanonicalMapping
-    }
-
-    private func signatureForText(_ normalizedText: String) -> String {
-        "t:\(sha256Hex(Data(normalizedText.utf8)))"
-    }
-
-    private func signatureForImage(_ image: NSImage, fallbackData: Data) -> String {
-        if let normalizedPixels = image.normalizedPixelSignatureData() {
-            return "i:pixel:\(sha256Hex(normalizedPixels))"
-        }
-        return "i:fallback:\(sha256Hex(fallbackData))"
-    }
-
-    private func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private func loadFromDisk() {
@@ -309,18 +309,270 @@ final class ClipboardStore: ObservableObject {
         }
     }
 
-    private func persist() {
+    private func schedulePersist() {
+        pendingPersistTask?.cancel()
+
+        let entriesSnapshot = entries
+        let url = persistenceURL
+        let writer = persistenceWriter
+
+        pendingPersistTask = Task.detached(priority: .utility) { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.persistenceDebounceNanoseconds)
+                try Task.checkCancellation()
+                try await writer.write(entriesSnapshot, to: url)
+            } catch is CancellationError {
+                return
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.logger.error("Failed to persist clipboard history: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func flushPendingPersistence() {
+        pendingPersistTask?.cancel()
+        pendingPersistTask = nil
+
         do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(entries)
-            try data.write(to: persistenceURL, options: .atomic)
+            try ClipboardHistoryPersistenceWriter.writeImmediately(entries, to: persistenceURL)
         } catch {
             logger.error("Failed to persist clipboard history: \(error.localizedDescription)")
         }
     }
+}
 
+private enum ClipboardLimits {
+    static let maxCapturedTextUTF8Bytes = 1_000_000
+    static let maxRichTextDataBytes = 2_000_000
+    static let maxRawImageBytes = 40_000_000
+    static let maxCapturedImagePixels = 8_000_000
+    static let maxPersistedImagePNGBytes = 20_000_000
+}
+
+private enum ClipboardPayload: Sendable {
+    case plainText(String)
+    case plainTextData(Data)
+    case richTextData(Data, RichTextDocumentKind)
+    case imageData(Data, ImageRepresentation)
+}
+
+private enum RichTextDocumentKind: Sendable {
+    case rtf
+    case html
+
+    var documentType: NSAttributedString.DocumentType {
+        switch self {
+        case .rtf: return .rtf
+        case .html: return .html
+        }
+    }
+}
+
+private enum ImageRepresentation: Sendable {
+    case png
+    case tiff
+}
+
+private struct CapturedEntry: Sendable {
+    let entry: ClipboardEntry
+    let signature: String
+}
+
+private enum ClipboardPayloadProcessor {
+    static func process(_ payload: ClipboardPayload) -> CapturedEntry? {
+        if Task.isCancelled { return nil }
+
+        switch payload {
+        case .plainText(let text):
+            return processText(text)
+        case .plainTextData(let data):
+            guard data.count <= ClipboardLimits.maxCapturedTextUTF8Bytes else { return nil }
+            guard let text = decodePlainText(data) else { return nil }
+            return processText(text)
+        case .richTextData(let data, let kind):
+            guard data.count <= ClipboardLimits.maxRichTextDataBytes else { return nil }
+            guard let text = extractPlainText(from: data, kind: kind) else { return nil }
+            return processText(text)
+        case .imageData(let data, let representation):
+            return processImage(data, representation: representation)
+        }
+    }
+
+    static func signature(forStoredEntry entry: ClipboardEntry) -> String? {
+        switch entry.kind {
+        case .text:
+            guard let text = entry.text else { return nil }
+            let normalized = normalizeTextForSignature(text)
+            guard !normalized.isEmpty else { return nil }
+            return signatureForText(normalized)
+        case .image:
+            guard let pngData = entry.imagePNGData else { return nil }
+            if let normalizedPixels = normalizedPixelSignatureData(from: pngData) {
+                return "i:pixel:\(sha256Hex(normalizedPixels))"
+            }
+            return "i:fallback:\(sha256Hex(pngData))"
+        }
+    }
+
+    private static func processText(_ text: String) -> CapturedEntry? {
+        guard text.utf8.count <= ClipboardLimits.maxCapturedTextUTF8Bytes else { return nil }
+
+        let normalized = normalizeTextForSignature(text)
+        guard !normalized.isEmpty else { return nil }
+
+        return CapturedEntry(
+            entry: ClipboardEntry(text: text),
+            signature: signatureForText(normalized)
+        )
+    }
+
+    private static func processImage(_ data: Data, representation: ImageRepresentation) -> CapturedEntry? {
+        guard data.count <= ClipboardLimits.maxRawImageBytes else { return nil }
+        guard let normalizedPixels = normalizedPixelSignatureData(from: data) else { return nil }
+        guard let pngData = pngData(from: data, representation: representation) else { return nil }
+        guard pngData.count <= ClipboardLimits.maxPersistedImagePNGBytes else { return nil }
+
+        return CapturedEntry(
+            entry: ClipboardEntry(imagePNGData: pngData),
+            signature: "i:pixel:\(sha256Hex(normalizedPixels))"
+        )
+    }
+
+    private static func decodePlainText(_ data: Data) -> String? {
+        String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .utf16)
+            ?? String(data: data, encoding: .utf16LittleEndian)
+            ?? String(data: data, encoding: .utf16BigEndian)
+    }
+
+    private static func extractPlainText(from data: Data, kind: RichTextDocumentKind) -> String? {
+        let attributed = try? NSAttributedString(
+            data: data,
+            options: [.documentType: kind.documentType],
+            documentAttributes: nil
+        )
+        let text = attributed?.string ?? ""
+        return text.isEmpty ? nil : text
+    }
+
+    private static func normalizeTextForSignature(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .precomposedStringWithCanonicalMapping
+    }
+
+    private static func signatureForText(_ normalizedText: String) -> String {
+        "t:\(sha256Hex(Data(normalizedText.utf8)))"
+    }
+
+    private static func normalizedPixelSignatureData(from data: Data) -> Data? {
+        guard let image = makeCGImage(from: data) else { return nil }
+
+        let width = image.width
+        let height = image.height
+        guard width > 0, height > 0 else { return nil }
+        guard width <= ClipboardLimits.maxCapturedImagePixels / height else { return nil }
+
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        let pixelByteCount = height * bytesPerRow
+        var pixels = Data(count: pixelByteCount)
+
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+
+        let rendered = pixels.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress else { return false }
+            guard
+                let context = CGContext(
+                    data: baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: colorSpace,
+                    bitmapInfo: bitmapInfo
+                )
+            else {
+                return false
+            }
+
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+
+        guard rendered else { return nil }
+
+        var signatureData = Data()
+        signatureData.appendUInt32BigEndian(UInt32(width))
+        signatureData.appendUInt32BigEndian(UInt32(height))
+        signatureData.append(pixels)
+        return signatureData
+    }
+
+    private static func pngData(from data: Data, representation: ImageRepresentation) -> Data? {
+        switch representation {
+        case .png:
+            return data.count <= ClipboardLimits.maxPersistedImagePNGBytes ? data : nil
+        case .tiff:
+            guard let image = makeCGImage(from: data) else { return nil }
+
+            let pngData = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                pngData,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            ) else {
+                return nil
+            }
+
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+            return pngData as Data
+        }
+    }
+
+    private static func makeCGImage(from data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            return nil
+        }
+        guard
+            let width = integerProperty(kCGImagePropertyPixelWidth, in: properties),
+            let height = integerProperty(kCGImagePropertyPixelHeight, in: properties),
+            width > 0,
+            height > 0,
+            width <= ClipboardLimits.maxCapturedImagePixels / height
+        else {
+            return nil
+        }
+
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+
+    private static func integerProperty(_ key: CFString, in properties: [CFString: Any]) -> Int? {
+        if let value = properties[key] as? Int {
+            return value
+        }
+
+        if let value = properties[key] as? NSNumber {
+            return value.intValue
+        }
+
+        return nil
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+extension ClipboardStore {
     private static func makeSupportDirectory(using fileManager: FileManager) -> URL {
         let baseDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
@@ -361,82 +613,17 @@ final class ClipboardStore: ObservableObject {
     }
 }
 
-private struct CapturedEntry {
-    let entry: ClipboardEntry
-    let signature: String
-}
-
-private extension NSImage {
-    func pngData() -> Data? {
-        guard
-            let tiffRepresentation,
-            let bitmap = NSBitmapImageRep(data: tiffRepresentation)
-        else {
-            return nil
-        }
-
-        return bitmap.representation(using: .png, properties: [:])
+private actor ClipboardHistoryPersistenceWriter {
+    func write(_ entries: [ClipboardEntry], to url: URL) throws {
+        try Self.writeImmediately(entries, to: url)
     }
 
-    func normalizedPixelSignatureData() -> Data? {
-        guard let image = cgImageForSignature() else { return nil }
-
-        let width = image.width
-        let height = image.height
-        guard width > 0, height > 0 else { return nil }
-
-        let bytesPerPixel = 4
-        let bytesPerRow = width * bytesPerPixel
-        let pixelByteCount = height * bytesPerRow
-        var pixels = Data(count: pixelByteCount)
-
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-
-        let rendered = pixels.withUnsafeMutableBytes { rawBuffer -> Bool in
-            guard let baseAddress = rawBuffer.baseAddress else { return false }
-            guard
-                let context = CGContext(
-                    data: baseAddress,
-                    width: width,
-                    height: height,
-                    bitsPerComponent: 8,
-                    bytesPerRow: bytesPerRow,
-                    space: colorSpace,
-                    bitmapInfo: bitmapInfo
-                )
-            else {
-                return false
-            }
-
-            context.interpolationQuality = .none
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-
-        guard rendered else { return nil }
-
-        var signatureData = Data()
-        signatureData.appendUInt32BigEndian(UInt32(width))
-        signatureData.appendUInt32BigEndian(UInt32(height))
-        signatureData.append(pixels)
-        return signatureData
-    }
-
-    private func cgImageForSignature() -> CGImage? {
-        var proposedRect = NSRect(origin: .zero, size: size)
-        if let cgImage = cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) {
-            return cgImage
-        }
-
-        guard
-            let tiffRepresentation,
-            let bitmap = NSBitmapImageRep(data: tiffRepresentation)
-        else {
-            return nil
-        }
-
-        return bitmap.cgImage
+    nonisolated static func writeImmediately(_ entries: [ClipboardEntry], to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(entries)
+        try data.write(to: url, options: .atomic)
     }
 }
 

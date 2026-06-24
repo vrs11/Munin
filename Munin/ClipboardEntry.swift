@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-struct ClipboardEntry: Identifiable, Codable, Equatable {
+struct ClipboardEntry: Identifiable, Codable, Equatable, Sendable {
     enum Kind: String, Codable {
         case text
         case image

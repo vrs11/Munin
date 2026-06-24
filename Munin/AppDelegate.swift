@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import os
 import SwiftUI
 
 @main
@@ -16,19 +17,27 @@ struct MuninApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = ClipboardStore()
     private let shortcutPreferences = ShortcutPreferences()
     private let quickPasteViewModel = QuickPasteViewModel()
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.studio11.munin", category: "AppDelegate")
 
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
+    private var pauseCaptureMenuItem: NSMenuItem?
+    private var clearHistoryMenuItem: NSMenuItem?
     private var panel: NSPanel?
     private var quickPastePanel: QuickPastePanel?
     private var configWindow: NSWindow?
     private var hotKeyManager: GlobalHotKeyManager?
     private var copyCommandMonitor: CopyCommandMonitor?
     private var isOpeningPanel = false
+    private var isQuickPasteActive = false
+    private var quickPasteTargetApplication: NSRunningApplication?
+
+    private static let quickPasteFocusRetryDelay: TimeInterval = 0.05
+    private static let quickPasteMaxFocusAttempts = 8
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -78,10 +87,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureStatusMenu() {
         let menu = NSMenu()
+        menu.delegate = self
 
         let configItem = NSMenuItem(title: "Config", action: #selector(openConfigWindow(_:)), keyEquivalent: ",")
         configItem.target = self
         menu.addItem(configItem)
+
+        let pauseItem = NSMenuItem(title: "Pause Capture", action: #selector(toggleCapturePause(_:)), keyEquivalent: "")
+        pauseItem.target = self
+        menu.addItem(pauseItem)
+        pauseCaptureMenuItem = pauseItem
+
+        let clearItem = NSMenuItem(title: "Clear History", action: #selector(clearHistory(_:)), keyEquivalent: "")
+        clearItem.target = self
+        menu.addItem(clearItem)
+        clearHistoryMenuItem = clearItem
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit Munin", action: #selector(quit(_:)), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
 
         statusMenu = menu
     }
@@ -186,10 +212,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeyManager = manager
 
         shortcutPreferences.onChange = { [weak self] configuration in
-            self?.hotKeyManager?.register(configuration: configuration)
+            self?.registerShortcut(configuration)
         }
 
-        manager.register(configuration: shortcutPreferences.configuration)
+        registerShortcut(shortcutPreferences.configuration)
     }
 
     private func configureCopyCommandMonitor() {
@@ -202,6 +228,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc
     private func togglePanel(_ sender: AnyObject?) {
+        if quickPastePanel?.isVisible == true {
+            hideQuickPastePanel()
+            return
+        }
+        isQuickPasteActive = false
+
         if NSApp.currentEvent?.type == .rightMouseUp {
             showStatusMenu()
             return
@@ -230,6 +262,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         configWindow.center()
         configWindow.makeKeyAndOrderFront(nil)
+    }
+
+    @objc
+    private func toggleCapturePause(_ sender: Any?) {
+        store.setMonitoringPaused(!store.isMonitoringPaused)
+    }
+
+    @objc
+    private func clearHistory(_ sender: Any?) {
+        store.clearHistory()
+    }
+
+    @objc
+    private func quit(_ sender: Any?) {
+        NSApp.terminate(nil)
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        pauseCaptureMenuItem?.title = store.isMonitoringPaused ? "Resume Capture" : "Pause Capture"
+        clearHistoryMenuItem?.isEnabled = !store.entries.isEmpty
     }
 
     private func showPanel(_ panel: NSPanel, anchoredTo button: NSStatusBarButton) {
@@ -282,13 +334,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showQuickPastePanelFromShortcut() {
         guard let quickPanel = quickPastePanel else { return }
 
+        if quickPanel.isVisible {
+            hideQuickPastePanel()
+            return
+        }
+
         // Shortcut should only show the quick popup.
         panel?.orderOut(nil)
+        isQuickPasteActive = true
+
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        if frontmostApplication?.processIdentifier != NSRunningApplication.current.processIdentifier {
+            quickPasteTargetApplication = frontmostApplication
+        }
 
         quickPasteViewModel.setEntries(Array(store.entries.prefix(10)))
         positionQuickPastePanel(quickPanel)
 
         NSApp.activate(ignoringOtherApps: true)
+        panel?.orderOut(nil)
         quickPanel.orderFrontRegardless()
         quickPanel.makeKeyAndOrderFront(nil)
     }
@@ -309,6 +373,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hideQuickPastePanel() {
         quickPastePanel?.orderOut(nil)
+        isQuickPasteActive = false
+        quickPasteTargetApplication = nil
     }
 
     private func activateSelectedQuickPasteEntry() {
@@ -322,14 +388,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func insertEntryIntoFocusedApp(_ entry: ClipboardEntry) {
         store.copyEntryToPasteboard(entry)
+        let targetApplication = quickPasteTargetApplication
         hideQuickPastePanel()
 
-        // Return focus to previous app and simulate Cmd+V.
-        NSApp.hide(nil)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.postCommandV()
+        if let targetApplication, !targetApplication.isTerminated {
+            let activated = targetApplication.activate(options: [.activateIgnoringOtherApps])
+            if !activated {
+                logger.error("Failed to reactivate quick paste target app")
+            }
+        } else {
+            NSApp.hide(nil)
         }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.quickPasteFocusRetryDelay) { [weak self] in
+            self?.postCommandVWhenTargetReady(targetApplication, attempt: 0)
+        }
+    }
+
+    private func postCommandVWhenTargetReady(_ targetApplication: NSRunningApplication?, attempt: Int) {
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+
+        if let targetApplication, !targetApplication.isTerminated {
+            if frontmostApplication?.processIdentifier != targetApplication.processIdentifier {
+                guard attempt < Self.quickPasteMaxFocusAttempts else {
+                    logger.error("Quick paste cancelled because the target app did not regain focus")
+                    quickPasteTargetApplication = nil
+                    return
+                }
+
+                _ = targetApplication.activate(options: [.activateIgnoringOtherApps])
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.quickPasteFocusRetryDelay) { [weak self] in
+                    self?.postCommandVWhenTargetReady(targetApplication, attempt: attempt + 1)
+                }
+                return
+            }
+        } else if frontmostApplication?.processIdentifier == NSRunningApplication.current.processIdentifier {
+            logger.error("Quick paste cancelled because Munin still has focus")
+            quickPasteTargetApplication = nil
+            return
+        }
+
+        postCommandV()
+        quickPasteTargetApplication = nil
     }
 
     private func postCommandV() {
@@ -349,6 +449,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func ensureAccessibilityPermission() -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func registerShortcut(_ configuration: ShortcutConfiguration) {
+        let status = hotKeyManager?.register(configuration: configuration) ?? OSStatus(eventNotHandledErr)
+        shortcutPreferences.setRegistrationStatus(status)
+
+        if status != noErr {
+            logger.error("Failed to register global hotkey: \(status, privacy: .public)")
+        }
     }
 }
 
@@ -458,6 +567,7 @@ final class ShortcutPreferences: ObservableObject {
             onChange?(configuration)
         }
     }
+    @Published private(set) var registrationStatusMessage: String?
 
     var onChange: ((ShortcutConfiguration) -> Void)?
 
@@ -483,6 +593,14 @@ final class ShortcutPreferences: ObservableObject {
         guard let data = defaults.data(forKey: ShortcutConfiguration.storageKey) else { return nil }
         return try? JSONDecoder().decode(ShortcutConfiguration.self, from: data)
     }
+
+    func setRegistrationStatus(_ status: OSStatus) {
+        if status == noErr {
+            registrationStatusMessage = nil
+        } else {
+            registrationStatusMessage = "Shortcut could not be registered. Try another combination. OSStatus: \(status)"
+        }
+    }
 }
 
 private struct ShortcutConfigView: View {
@@ -499,6 +617,12 @@ private struct ShortcutConfigView: View {
             Text("Current: \(preferences.configuration.displayString)")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+
+            if let message = preferences.registrationStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
 
             Text("Click the field, press your shortcut. Esc cancels recording.")
                 .font(.caption)
@@ -677,18 +801,24 @@ private final class GlobalHotKeyManager {
         }
     }
 
-    func register(configuration: ShortcutConfiguration) {
+    func register(configuration: ShortcutConfiguration) -> OSStatus {
         unregister()
+        guard eventHandlerRef != nil else { return OSStatus(eventNotHandledErr) }
 
         let identifier = EventHotKeyID(signature: Self.hotKeySignature, id: Self.hotKeyID)
-        RegisterEventHotKey(
+        var newHotKeyRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(
             configuration.keyCode,
             configuration.modifiers,
             identifier,
             GetApplicationEventTarget(),
             0,
-            &hotKeyRef
+            &newHotKeyRef
         )
+        guard status == noErr else { return status }
+
+        hotKeyRef = newHotKeyRef
+        return noErr
     }
 
     func unregister() {
@@ -705,7 +835,7 @@ private final class GlobalHotKeyManager {
         )
         let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
-        InstallEventHandler(
+        let status = InstallEventHandler(
             GetApplicationEventTarget(),
             globalHotKeyEventHandler,
             1,
@@ -713,6 +843,9 @@ private final class GlobalHotKeyManager {
             userData,
             &eventHandlerRef
         )
+        if status != noErr {
+            eventHandlerRef = nil
+        }
     }
 
     fileprivate func handleHotKeyEvent(_ event: EventRef?) -> OSStatus {
